@@ -86,6 +86,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   并发领取通过数据库条件更新串行化，**同一任务不会被重复分配**。
 - **上报**：只有持有与当前租约匹配的令牌才能成功/失败上报；旧令牌、
   租约到期后被重领的旧令牌、取消工作流的旧令牌一律 `403 invalid_token`。
+- **重复上报（幂等回执）**：首次成功受理时按 `任务 + 令牌` 持久保存该次的
+  状态码与响应体。同一令牌重发**相同类型与内容**的上报，原样返回首次的
+  状态码与响应体，不再改变任务状态、尝试次数或失败级联；同一令牌**改动
+  上报类型（succeed/fail）或请求内容**返回 `409 report_conflict`。
+  回执跨任务重领、工作流终结与进程重启保持有效，且按令牌哈希隔离，
+  其他令牌无法读取。从未被受理的令牌（过期、取消、重领后的旧令牌）
+  不留回执，仍按上述失效规则拒绝。
 - **失败/到期**：未达 `max_attempts` 回到 `pending` 可重领；达到上限置
   `failed`，其所有未完成后继递归置 `skipped`，其他分支继续执行。
 - **取消**：工作流置 `cancelled`，所有未完成（`pending`/`leased`）任务置
@@ -160,14 +167,53 @@ curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/fail \
 跨工作流通用工作进程只需把领取地址换成
 `POST http://127.0.0.1:8000/claims/claim`，响应中带有 `workflow_id`。
 
-### 5.3 查询与取消
+### 5.3 重复上报与冲突（断连重试）
+
+工作进程上报后若连接断开，无法确定服务是否受理，直接**原样重发同一请求**
+即可，无需任何额外参数：
+
+```bash
+# 第一次上报（可能成功但响应丢失）
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=1024\"}"
+# 200 {"workflow_id":"...","task_id":"...","status":"succeeded","attempts":1}
+
+# 重发相同内容：返回与首次完全相同的状态码与响应体，
+# 任务状态、尝试次数、失败级联均不再变化
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=1024\"}"
+# 200 {"workflow_id":"...","task_id":"...","status":"succeeded","attempts":1}
+```
+
+同一令牌**改动上报类型或请求内容**则返回明确冲突，任务状态不受影响：
+
+```bash
+# 改内容：result 不同
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=2048\"}"
+# 409 {"error":{"code":"report_conflict","message":"该令牌的上报已被受理，更改上报类型或请求内容构成冲突","task_id":"...","accepted_type":"succeed"}}
+
+# 改类型：同一令牌改用 fail 上报
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/fail \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"error\": \"changed my mind\"}"
+# 409 {"error":{"code":"report_conflict", ... ,"accepted_type":"succeed"}}
+```
+
+回执在任务被重领、工作流终结、服务重启之后仍可凭原令牌重放；其他令牌
+（包括重领得到的新令牌）读不到该回执，按自身情况正常校验。
+
+### 5.4 查询与取消
 
 ```bash
 curl -s http://127.0.0.1:8000/workflows/<WORKFLOW_ID>
 curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/cancel
 ```
 
-### 5.4 Python 示例脚本（仅标准库）
+### 5.5 Python 示例脚本（仅标准库）
 
 ```bash
 python examples/client_demo.py          # 提交→幂等→冲突→重试→完成 全流程
@@ -185,7 +231,7 @@ python examples/worker.py               # 通用工作进程（轮询 /claims/cl
 | HTTP | code |
 | --- | --- |
 | 422 | `missing_dependency` / `duplicate_task_key` / `dependency_cycle` |
-| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` |
+| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` / `report_conflict` |
 | 403 | `invalid_token` |
 | 404 | `workflow_not_found` / `task_not_found` |
 
@@ -198,6 +244,7 @@ python -m pytest -q
 
 覆盖：图校验三类拒绝、幂等提交/冲突、依赖门控、令牌鉴权与一次性、
 失败重试与上限级联、租约到期（懒回收 + 后台线程）、取消、
+重复上报重放/同令牌冲突/回执跨重领·终结·重启、
 20 线程并发领取不重复分配、跨“重启”状态与租约保持。
 
 ## 8. 目录结构

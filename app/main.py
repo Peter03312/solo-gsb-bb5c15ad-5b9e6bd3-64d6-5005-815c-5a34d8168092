@@ -179,7 +179,7 @@ def create_app() -> FastAPI:
     def task_succeed(
         task_id: str, body: ReportIn, conn=Depends(get_conn)
     ):
-        return service.report_task(
+        payload, status_code, replayed = service.report_task(
             conn,
             settings,
             task_id,
@@ -189,6 +189,10 @@ def create_app() -> FastAPI:
             result=body.result,
             now=now_iso(),
         )
+        if replayed:
+            # 已受理回执：原状态码与响应体逐字重放
+            return JSONResponse(status_code=status_code, content=payload)
+        return payload
 
     @app.post(
         "/tasks/{task_id}/fail",
@@ -196,7 +200,7 @@ def create_app() -> FastAPI:
         tags=["tasks"],
     )
     def task_fail(task_id: str, body: ReportIn, conn=Depends(get_conn)):
-        return service.report_task(
+        payload, status_code, replayed = service.report_task(
             conn,
             settings,
             task_id,
@@ -206,6 +210,9 @@ def create_app() -> FastAPI:
             result=None,
             now=now_iso(),
         )
+        if replayed:
+            return JSONResponse(status_code=status_code, content=payload)
+        return payload
 
     return app
 

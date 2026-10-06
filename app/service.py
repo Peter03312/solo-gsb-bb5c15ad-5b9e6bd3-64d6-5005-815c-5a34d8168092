@@ -405,6 +405,17 @@ def claim_task(
 # --------------------------------------------------------------------------- #
 # 上报结果
 # --------------------------------------------------------------------------- #
+def _report_request_hash(error: str | None, result: str | None) -> str:
+    """上报请求内容（令牌与上报类型除外的请求字段）规范化哈希。"""
+    canonical = json.dumps(
+        {"error": error, "result": result},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return _sha256(canonical)
+
+
 def report_task(
     conn: sqlite3.Connection,
     settings: Settings,
@@ -414,7 +425,20 @@ def report_task(
     error: str | None,
     result: str | None,
     now: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int, bool]:
+    """处理成功/失败上报，返回 (响应体, HTTP 状态码, 是否重放回执)。
+
+    重复上报识别：任务 + 令牌哈希唯一确定一条已受理回执。
+    - 同令牌重发相同类型与内容：原样返回首次受理的状态码与响应体，
+      不再改变任务状态、尝试次数或失败级联；
+    - 同令牌改动上报类型或请求内容：409 report_conflict；
+    - 从未被受理的令牌（过期、取消、重领后的旧令牌）：不落回执，
+      仍按现有失效规则拒绝。
+    """
+    report_type = "succeed" if success else "fail"
+    token_hash = _sha256(token)
+    request_hash = _report_request_hash(error, result)
+
     with transaction(conn):
         affected = expire_leases(conn, now)
 
@@ -424,13 +448,41 @@ def report_task(
         if task is None:
             raise ServiceError("task_not_found", "任务不存在", 404)
 
+        # 已受理回执优先于一切现状校验：跨重试、任务重领、工作流终结
+        # 与进程重启均可重放；键内含令牌哈希，其他令牌无法命中读取。
+        receipt = conn.execute(
+            """SELECT report_type, request_hash, status_code, response_body
+               FROM report_receipts
+               WHERE task_id = ? AND token_hash = ?""",
+            (task_id, token_hash),
+        ).fetchone()
+        if receipt is not None:
+            if (
+                receipt["report_type"] == report_type
+                and receipt["request_hash"] == request_hash
+            ):
+                return (
+                    json.loads(receipt["response_body"]),
+                    receipt["status_code"],
+                    True,
+                )
+            raise ServiceError(
+                "report_conflict",
+                "该令牌的上报已被受理，更改上报类型或请求内容构成冲突",
+                409,
+                {
+                    "task_id": task_id,
+                    "accepted_type": receipt["report_type"],
+                },
+            )
+
         wf = conn.execute(
             "SELECT status FROM workflows WHERE id = ?",
             (task["workflow_id"],),
         ).fetchone()
 
         if not task["token_hash"] or not hmac.compare_digest(
-            task["token_hash"], _sha256(token)
+            task["token_hash"], token_hash
         ):
             raise ServiceError(
                 "invalid_token",
@@ -486,12 +538,29 @@ def report_task(
             "SELECT id, workflow_id, status, attempts FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        return {
+        payload = {
             "workflow_id": row["workflow_id"],
             "task_id": row["id"],
             "status": row["status"],
             "attempts": row["attempts"],
         }
+        # 首次成功受理：持久化回执，供后续重试原样重放
+        conn.execute(
+            """INSERT INTO report_receipts
+               (task_id, token_hash, report_type, request_hash,
+                status_code, response_body, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                token_hash,
+                report_type,
+                request_hash,
+                200,
+                json.dumps(payload, ensure_ascii=False),
+                now,
+            ),
+        )
+        return payload, 200, False
 
 
 # --------------------------------------------------------------------------- #
