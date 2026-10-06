@@ -74,17 +74,24 @@ def test_only_valid_token_can_report(client):
     assert succeed(client, lease).status_code == 200
 
 
-def test_token_single_use_old_token_rejected(client):
+def test_token_single_use_reclaim_then_replay_or_conflict(client):
     wf = submit(client, [t("a")], max_attempts=3)
     lease1 = claim(client, wf["id"])
-    fail(client, lease1)  # 回到 pending
+    first = fail(client, lease1)  # 受理：回到 pending，生成回执
+    assert first.status_code == 200
     lease2 = claim(client, wf["id"])
     assert lease2["attempt"] == 2
     assert lease2["token"] != lease1["token"]
 
-    # 旧令牌失效
+    # 旧令牌重发相同内容 -> 重放首次受理响应，不触碰当前租约
+    replay = fail(client, lease1)
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    # 旧令牌改动上报类型 -> 明确冲突
     resp = succeed(client, lease1)
-    assert resp.status_code == 403
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "report_conflict"
+
     assert succeed(client, lease2).status_code == 200
 
 

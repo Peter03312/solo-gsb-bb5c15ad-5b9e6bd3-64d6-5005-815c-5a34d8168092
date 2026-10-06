@@ -135,6 +135,19 @@ def request_fingerprint(payload: WorkflowIn) -> str:
     return _sha256(canonical)
 
 
+def _report_request_hash(
+    report_type: str, error: str | None, result: str | None
+) -> str:
+    """上报类型 + 请求字段的规范化哈希，用于识别重复/冲突上报。"""
+    canonical = json.dumps(
+        {"type": report_type, "error": error, "result": result},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return _sha256(canonical)
+
+
 # --------------------------------------------------------------------------- #
 # 提交工作流（图接受后不可改：无任何更新任务图的接口）
 # --------------------------------------------------------------------------- #
@@ -415,6 +428,10 @@ def report_task(
     result: str | None,
     now: str,
 ) -> dict[str, Any]:
+    report_type = "succeed" if success else "fail"
+    token_hash = _sha256(token)
+    request_hash = _report_request_hash(report_type, error, result)
+
     with transaction(conn):
         affected = expire_leases(conn, now)
 
@@ -424,13 +441,40 @@ def report_task(
         if task is None:
             raise ServiceError("task_not_found", "任务不存在", 404)
 
+        # 已受理回执优先于令牌/状态校验：同一令牌重发相同内容，
+        # 原样返回首次受理的状态码与响应体，不再触碰任务状态、
+        # 尝试次数与失败级联；同一令牌改动上报类型或请求字段则
+        # 明确冲突。回执按 (任务, 令牌哈希) 隔离，其他令牌不可读。
+        receipt = conn.execute(
+            "SELECT report_type, request_hash, response_body "
+            "FROM report_receipts WHERE task_id = ? AND token_hash = ?",
+            (task_id, token_hash),
+        ).fetchone()
+        if receipt is not None:
+            if (
+                receipt["report_type"] != report_type
+                or receipt["request_hash"] != request_hash
+            ):
+                raise ServiceError(
+                    "report_conflict",
+                    "该令牌的上报已被受理，重复上报不得改动类型或内容",
+                    409,
+                    {
+                        "task_id": task_id,
+                        "accepted_type": receipt["report_type"],
+                    },
+                )
+            for wf_id in affected:
+                finalize_workflow(conn, wf_id, now)
+            return json.loads(receipt["response_body"])
+
         wf = conn.execute(
             "SELECT status FROM workflows WHERE id = ?",
             (task["workflow_id"],),
         ).fetchone()
 
         if not task["token_hash"] or not hmac.compare_digest(
-            task["token_hash"], _sha256(token)
+            task["token_hash"], token_hash
         ):
             raise ServiceError(
                 "invalid_token",
@@ -486,12 +530,31 @@ def report_task(
             "SELECT id, workflow_id, status, attempts FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        return {
+        response = {
             "workflow_id": row["workflow_id"],
             "task_id": row["id"],
             "status": row["status"],
             "attempts": row["attempts"],
         }
+        # 首次受理即在同一事务内持久化回执：此后同令牌重发可原样重放，
+        # 工作流终结、任务被重领、进程重启均不影响；未受理（校验失败
+        # 抛错回滚）的上报不会留下回执，重试仍按失效规则拒绝。
+        conn.execute(
+            """INSERT INTO report_receipts
+               (task_id, token_hash, report_type, request_hash,
+                status_code, response_body, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                token_hash,
+                report_type,
+                request_hash,
+                200,
+                json.dumps(response, ensure_ascii=False),
+                now,
+            ),
+        )
+        return response
 
 
 # --------------------------------------------------------------------------- #

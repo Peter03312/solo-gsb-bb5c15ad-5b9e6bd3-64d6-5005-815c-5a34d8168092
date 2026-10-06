@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 
 CREATE INDEX IF NOT EXISTS idx_deps_depends_on
     ON task_dependencies (depends_on_id);
+
+-- 已受理上报回执：首次受理（HTTP 200）时同事务落库，
+-- 同一令牌重发相同内容可原样重放；按令牌哈希隔离，其他令牌不可读。
+CREATE TABLE IF NOT EXISTS report_receipts (
+    task_id       TEXT NOT NULL REFERENCES tasks(id),
+    token_hash    TEXT NOT NULL,
+    report_type   TEXT NOT NULL,
+    request_hash  TEXT NOT NULL,
+    status_code   INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (task_id, token_hash)
+);
 """
 
 

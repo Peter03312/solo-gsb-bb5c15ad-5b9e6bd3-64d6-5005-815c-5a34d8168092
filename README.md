@@ -1,8 +1,9 @@
 # 批处理任务编排服务（Python + FastAPI + SQLite）
 
 外部工作进程通过 HTTP 领取并执行任务的批处理编排服务。支持以 DAG 描述工作流、
-幂等提交、租约令牌、失败重试、租约到期回收、失败级联跳过、取消与状态查询；
-所有状态保存在 SQLite，**进程/容器重启后状态和租约继续有效**。
+幂等提交、租约令牌、失败重试、租约到期回收、失败级联跳过、取消、状态查询与
+**重复上报受理回执**（上报后断连可安全重发）；所有状态保存在 SQLite，
+**进程/容器重启后状态、租约与已受理回执继续有效**。
 
 ## 1. 一键启动（Docker Compose）
 
@@ -86,6 +87,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   并发领取通过数据库条件更新串行化，**同一任务不会被重复分配**。
 - **上报**：只有持有与当前租约匹配的令牌才能成功/失败上报；旧令牌、
   租约到期后被重领的旧令牌、取消工作流的旧令牌一律 `403 invalid_token`。
+- **重复上报（受理回执）**：首次成功受理（HTTP 200）时按
+  `任务 + 令牌 + 上报类型 + 请求字段` 持久保存该次响应；同一令牌重发
+  **相同内容**原样返回首次的状态码与响应体，不再改变任务状态、尝试次数
+  或失败级联；同一令牌**改动上报类型（succeed/fail）或请求字段
+  （result/error）**返回 `409 report_conflict`。回执只认原令牌，
+  其他令牌（含重领后的新令牌）无法读取；已受理回执在工作流终结、
+  任务重领与服务重启后仍可重放。首次未受理（过期/取消/重领）的令牌
+  不产生回执，重试仍按失效规则拒绝。
 - **失败/到期**：未达 `max_attempts` 回到 `pending` 可重领；达到上限置
   `failed`，其所有未完成后继递归置 `skipped`，其他分支继续执行。
 - **取消**：工作流置 `cancelled`，所有未完成（`pending`/`leased`）任务置
@@ -160,14 +169,56 @@ curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/fail \
 跨工作流通用工作进程只需把领取地址换成
 `POST http://127.0.0.1:8000/claims/claim`，响应中带有 `workflow_id`。
 
-### 5.3 查询与取消
+### 5.3 重复上报与冲突（受理回执）
+
+工作进程上报后若连接断开，无法确定服务是否已受理，直接**用同一令牌
+重发完全相同的请求**即可：首次受理的响应已持久化，重发原样返回，
+不会重复改变任务状态、尝试次数或触发失败级联。
+
+```bash
+# 第一次上报：受理成功（200），响应被持久保存
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=1024\"}"
+# 200 {"workflow_id":"...","task_id":"...","status":"succeeded","attempts":1}
+
+# 连接断开后重发相同内容：返回原状态码与响应体（即使工作流已终结、
+# 任务已被重领、服务已重启）
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=1024\"}"
+# 200 {"workflow_id":"...","task_id":"...","status":"succeeded","attempts":1}
+
+# 同一令牌改动请求字段：明确冲突
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"result\": \"rows=2048\"}"
+# 409 {"error":{"code":"report_conflict",
+#       "message":"该令牌的上报已被受理，重复上报不得改动类型或内容",
+#       "task_id":"...","accepted_type":"succeed"}}
+
+# 同一令牌改动上报类型（succeed -> fail）：同样冲突
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/fail \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"error\": \"boom\"}"
+# 409 {"error":{"code":"report_conflict", ...}}
+
+# 其他令牌（含任务重领后的新令牌、伪造令牌）读不到该回执，
+# 按自身有效性走正常校验：无效令牌仍是 403 invalid_token
+curl -s -X POST http://127.0.0.1:8000/tasks/$TASK_ID/succeed \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"forged-token\", \"result\": \"rows=1024\"}"
+# 403 {"error":{"code":"invalid_token", ...}}
+```
+
+### 5.4 查询与取消
 
 ```bash
 curl -s http://127.0.0.1:8000/workflows/<WORKFLOW_ID>
 curl -s -X POST http://127.0.0.1:8000/workflows/<WORKFLOW_ID>/cancel
 ```
 
-### 5.4 Python 示例脚本（仅标准库）
+### 5.5 Python 示例脚本（仅标准库）
 
 ```bash
 python examples/client_demo.py          # 提交→幂等→冲突→重试→完成 全流程
@@ -185,7 +236,7 @@ python examples/worker.py               # 通用工作进程（轮询 /claims/cl
 | HTTP | code |
 | --- | --- |
 | 422 | `missing_dependency` / `duplicate_task_key` / `dependency_cycle` |
-| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` |
+| 409 | `idempotency_conflict` / `workflow_terminal` / `not_leased` / `report_conflict` |
 | 403 | `invalid_token` |
 | 404 | `workflow_not_found` / `task_not_found` |
 
@@ -198,7 +249,9 @@ python -m pytest -q
 
 覆盖：图校验三类拒绝、幂等提交/冲突、依赖门控、令牌鉴权与一次性、
 失败重试与上限级联、租约到期（懒回收 + 后台线程）、取消、
-20 线程并发领取不重复分配、跨“重启”状态与租约保持。
+重复上报回执（重放/冲突/重启后保持/令牌隔离）、未受理令牌失效规则、
+20 线程并发领取不重复分配、8 线程并发重复上报一致受理、
+跨“重启”状态与租约保持。
 
 ## 8. 目录结构
 
